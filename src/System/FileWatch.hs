@@ -33,17 +33,11 @@ module System.FileWatch
   , Shell(..)
   , ProcHandler
   , EditProcess
-  , HeaderStyle
-  -- * Header styles
-  , asciiHeader
-  , unicodeHeader
-  , powerlineHeader
-  , coloredHeader
   -- * Shell actions
   , runShell
   , section
   , stage
-  , putHeader
+  , putSingleHeader
   , resetFailure
   -- * Running commands
   , shellIO
@@ -77,6 +71,7 @@ import qualified Data.Set as Set
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.UTF8 as UTF8
 
 import Control.Concurrent
 import Control.Monad
@@ -90,17 +85,13 @@ import System.INotify
 import System.Directory
 import System.FilePath
 import System.Environment
+import qualified System.Console.ANSI as ANSI
+import qualified System.Console.ANSI.Types as ANSI
 import System.Process hiding (Shell)
 import qualified System.Process as Process
 import System.Posix.Process (executeFile)
 import qualified System.Console.Terminal.Size as Size
 
-
--- | Style for stage headers,
--- each field is expected to be 1 characters wide
---
--- @('-','>','<','=')@ will be printed as @--> text <==@
-type HeaderStyle = (String, String, String, String)
 
 -- | Shell operations with an attached `FileWatchConfig`
 newtype Shell a = Shell
@@ -146,7 +137,7 @@ data FileWatchConfig = FileWatchConfig
   -- see `Data.Time.Format.formatTime`
   , timeFormat    :: Maybe String
   -- | Style for stage headers,
-  , headerStyle   :: HeaderStyle
+  , putHeader     :: String -> Shell ()
   -- | Path to the current watch program,
   -- set this to @\_\_FILE\_\_@
   , programPath   :: FilePath
@@ -179,21 +170,29 @@ instance Default FileWatchConfig where
     , runAction     = \_ -> return ()
     , watchFiles    = Set.singleton "."
     , timeFormat    = Just "%T"
-    , headerStyle   = unicodeHeader
+    , putHeader     = defaultPutHeader
     , programPath   = error "programPath not set"
-    , inotifyRoot   = undefined
-    , watchState    = undefined
+    , inotifyRoot   = error "inotifyRoot not set"
+    , watchState    = error "watchState not set"
     }
 
-asciiHeader :: HeaderStyle
-asciiHeader = ("=", ">", "<", "=")
-unicodeHeader :: HeaderStyle
-unicodeHeader  = ("━", "━", "━", "━")
-powerlineHeader :: HeaderStyle
-powerlineHeader = ("█", "\57520", "\57522", "█")
-coloredHeader :: Int -> HeaderStyle -> HeaderStyle
-coloredHeader n (a, b, c, d) = (f a, f b, f c, f d)
-  where f x = "\x1b[38;5;" ++ show n ++ "m" ++ x ++ "\x1b[0m"
+defaultPutHeader :: String -> Shell ()
+defaultPutHeader text = liftIO $ do
+  ANSI.setSGR
+    [ ANSI.Reset
+    , ANSI.SetColor ANSI.Foreground ANSI.Dull ANSI.Cyan
+    , ANSI.SetColor ANSI.Background ANSI.Vivid ANSI.White ]
+  putStr "\9608\9608\57520"
+  ANSI.setSGR
+    [ ANSI.SetColor ANSI.Foreground ANSI.Dull ANSI.Black
+    , ANSI.SetColor ANSI.Background ANSI.Vivid ANSI.White ]
+  putChar ' '
+  putStr text
+  putChar ' '
+  ANSI.clearFromCursorToLineEnd
+  putStrLn ""
+  ANSI.setSGR [ ANSI.Reset ]
+  return ()
 
 defaultRestartAction :: Shell ()
 defaultRestartAction = do
@@ -228,20 +227,13 @@ type ProcHandler r
 type EditProcess = CreateProcess -> CreateProcess
 
 putSectionHeader :: String -> Shell ()
-putSectionHeader header = ask >>= \conf@FileWatchConfig{..} -> liftIO $ do
-  cols <- termWidth
-  putStr "\x1b]133;A\a"
-  let pad = max 4 $ cols - length header - 2
-      (a, b, c, d) = headerStyle
-  putStr $ if null header
-    then concat (replicate cols a)
-    else concat (replicate (div pad 2 - 1) a) ++ b
-      ++ " " ++ take (cols - 6) header
-      ++ " " ++ c ++ concat (replicate (div (pad + 1) 2 - 1) d)
-  putStr "\x1b]133;B\a"
-  putStrLn ""
-  putStr "\x1b]133;C\a"
-  hFlush stdout
+putSectionHeader header = ask >>= \conf@FileWatchConfig{..} -> do
+  liftIO $ putStr "\x1b]133;A\a"
+  putHeader header
+  liftIO $ do
+    putStr "\x1b]133;B\a"
+    putStr "\x1b]133;C\a"
+    hFlush stdout
 
 putSectionFooter :: MonadIO m => m ()
 putSectionFooter = liftIO $ putStr "\x1b]133;D;0\a" >> hFlush stdout
@@ -332,8 +324,8 @@ resetFailure = ask >>= \conf@FileWatchConfig{..} ->
   liftIO $ modifyMVar_ watchState $ return . (#failAtStage .~ 0)
 
 -- | Print a stage header
-putHeader :: String -> Shell ()
-putHeader header = putSectionHeader header >> putSectionFooter
+putSingleHeader :: String -> Shell ()
+putSingleHeader header = putSectionHeader header >> putSectionFooter
 
 handleEvent :: FilePath -> Event -> Shell ()
 handleEvent path Closed{isDirectory=False, maybeFilePath=file, wasWriteable=True}
@@ -351,7 +343,7 @@ handleEvent path MovedOut{isDirectory=True, filePath=file}
 handleEvent path MovedIn{isDirectory=True, filePath=file}
   = addWatchPath (path </> BS.unpack file)
 handleEvent _ event = asks verbose >>= \v ->
-  when v $ putHeader $ "event: " ++ show event
+  when v $ putSingleHeader $ "event: " ++ show event
 
 killThreadRunner :: Shell ()
 killThreadRunner = ask >>= \conf@FileWatchConfig{..} -> liftIO $ do
@@ -377,11 +369,11 @@ runThreadRunner file = do
   when clearOnStart $ liftIO $ callProcess "tput" ["reset"]
   forM_ timeFormat $ \fmt -> do
     time <- liftIO getZonedTime
-    putHeader $ formatTime defaultTimeLocale fmt time
+    putSingleHeader $ formatTime defaultTimeLocale fmt time
   result <- liftIO $ try $ runShell (runAction file) conf
   section "done" (return ())
   case result of
-    Left exc -> putHeader $ "exception: " ++ show (exc :: SomeException)
+    Left exc -> putSingleHeader $ "exception: " ++ show (exc :: SomeException)
     Right _ -> liftIO $ modifyMVar_ watchState $ return . (#currentStage .~ 0)
 
 cleanupWatchDescs :: Shell ()
@@ -395,7 +387,7 @@ addWatchPath relpath = do
   conf@FileWatchConfig{..} <- ask
   path <- liftIO (makeAbsolute relpath)
   let watchEvents = [CloseWrite, Move, MoveSelf, Create, Delete, DeleteSelf]
-  desc <- liftIO $ addWatch inotifyRoot watchEvents (BS.pack path)
+  desc <- liftIO $ addWatch inotifyRoot watchEvents (UTF8.fromString path)
     $ \event -> runShell (handleEvent path event) conf
   files <- addWatchDir path
   liftIO $ modifyMVar_ watchState $ return .
@@ -444,9 +436,9 @@ watch conf = withINotify $ \inotify -> do
         , watchFiles = Set.fromList files
         }
   flip runShell conf' $ do
-    when verbose $ putHeader "setup inotify"
+    when verbose $ putSingleHeader "setup inotify"
     mapM_ addWatchPath watchFiles
-    when verbose $ putHeader "init action"
+    when verbose $ putSingleHeader "init action"
     initAction
   forever $ threadDelay 10000000
 
